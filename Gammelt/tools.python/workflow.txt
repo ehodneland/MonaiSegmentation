@@ -1,0 +1,47 @@
+# Trening med .py fil
+conda activate monai
+python tools.python/train_UNet_Monai.py   --modalities vibe2min   --reference vibe2min
+python tools.python/train_UNet_Monai.py   --modalities vibe2min T2 ADC   --reference vibe2min
+python tools.python/train_UNet_Monai.py   --modalities T2 ADC   --reference T2
+
+# Fine-tuning av eksisterende modell
+python tools.python/train_UNet_Monai.py --modalities vibe2min --reference vibe2min --datasets mont --gpu 1 --pretrained models/UNet_vibe2min_v01_bergen_20260312 --lr 1e-4 --freeze_mode decoder
+
+# Prediksjon av ensemble modell uten koregistrering, med nifti
+python3 tools.python/predict_UNet_Monai_ensemble.py --out test --model_root models/UNet_vibe2min_T2_ADC_v01_ensemble_20260108 --vibe2min /raid/erlend/GynKreft/Data-EC/Nifti/EC028/unregistered/vibe2min.nii.gz --T2 /raid/erlend/GynKreft/Data-EC/Nifti/EC028/registered/T2-2-vibe2min-header.nii.gz --ADC /raid/erlend/GynKreft/Data-EC/Nifti/EC028/registered/ADC-2-vibe2min-header.nii.gz 
+
+# Prediksjon av ensemble modell "med" koregistrering, med nifti
+python3 tools.python/predict_UNet_Monai_ensemble.py --out test --model_root models/UNet_vibe2min_T2_ADC_v01_ensemble_20260108 --vibe2min /raid/erlend/GynKreft/Data-EC/Nifti/EC028/unregistered/vibe2min.nii.gz --T2 /raid/erlend/GynKreft/Data-EC/Nifti/EC028/unregistered/T2.nii.gz --ADC /raid/erlend/GynKreft/Data-EC/Nifti/EC028/unregistered/ADC.nii.gz 
+
+# Prediksjon av ensemble modell "med" koregistrering, med dicom
+python3 tools.python/predict_UNet_Monai_ensemble.py --out test --model_root models/UNet_vibe2min_T2_ADC_v01_ensemble_20260108 --vibe2min /raid/erlend/GynKreft/Data-EC/Dicom/EC719/23_t1_vibe_dixon_tra_p2__2min_W --T2 /raid/erlend/GynKreft/Data-EC/Dicom/EC719/3_t2_tse_tra_p2_384 --ADC /raid/erlend/GynKreft/Data-EC/Dicom/EC719/9_resolve_diff_RSI_b0_500_1000_2500_tra_p2_3mm_ADC
+
+# Prediksjon med enkeltmodell med en kanal
+python3 tools.python/predict_UNet_Monai.py --model_dir models/UNet_vibe2min_v01_bergen_20260312 --out_dir test_Bergen/ --vibe2min /raid/erlend/GynKreft/Data-EC/Nifti/EC668/unregistered/vibe2min.nii.gz
+
+# Prediksjon med enkeltmodell med flere kanaler
+python3 tools.python/predict_UNet_Monai.py --model_dir models/UNet_vibe2min_T2_ADC_v01_bergen_20260319 --out_dir test_Bergen/ --vibe2min /raid/erlend/GynKreft/Data-EC/Nifti/EC668/unregistered/vibe2min.nii.gz --T2 /raid/erlend/GynKreft/Data-EC/Nifti/EC668/unregistered/T2.nii.gz --ADC /raid/erlend/GynKreft/Data-EC/Nifti/EC668/unregistered/ADC.nii.gz
+
+# Prediksjon av eksempel fra Hong Kong
+python3 tools.python/predict_UNet_Monai.py --model_dir models/UNet_vibe2min_v01_bergen_20260312 --out_dir test_HongKong/ --vibe2min test_HongKong/test_img.nii.gz
+
+# Trening med Bergen data
+python tools.python/train_UNet_Monai.py --modalities vibe2min T2 ADC --reference vibe2min --datasets bergen --gpu 1
+
+# Trening med Bergen og Montpelier data
+python tools.python/train_UNet_Monai.py --modalities vibe2min T2 ADC --reference vibe2min --datasets bergen mont
+
+# Placeholder for Hong-Kong-datasett
+# Oppdater først paths i params.py og datasetgenerator_hong_kong() i datasetgenerator.py
+python tools.python/train_UNet_Monai.py --modalities vibe2min T2 ADC --reference vibe2min --datasets hong_kong
+
+# Finetuning fra eksisterende UNet-modell
+python tools.python/train_UNet_Monai.py --modalities vibe2min T2 ADC --reference vibe2min --datasets bergen --gpu 1 --pretrained models/UNet_vibe2min_T2_ADC_v01_bergen_20260319 --lr 1e-4
+
+# Evaluer ekte UNet modell
+conda activate nnunet
+python tools.python/evaluate_nnUNet_v2.py \
+  --model_dir models/nnUNetv2_vibe2min_T2_ADC_v01_bergen_Dataset730_EC_20260518 \
+  --gpu 1 \
+  --checkpoint checkpoint_best.pth
+

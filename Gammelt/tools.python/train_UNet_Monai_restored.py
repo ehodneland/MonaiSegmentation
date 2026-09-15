@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Standardisert treningsscript for endometriekreft-tumorsegmentering
+- støtter 1-3 modaliteter (VIBE, T2, ADC)
+"""
+
+# ==========================================================
+# Standard library
+# ==========================================================
+import os
+import datetime
+import warnings
+import shutil
+import argparse
+
+# ==========================================================
+# Numerical / data
+# ==========================================================
+import numpy as np
+import pandas as pd
+import nibabel as nib
+
+# ==========================================================
+# PyTorch / TorchIO
+# ==========================================================
+import torch
+import torchio as tio
+from torch.utils.data import DataLoader
+
+# ==========================================================
+# MONAI
+# ==========================================================
+from monai.networks.nets import UNet
+from monai.losses import DiceLoss
+
+# ==========================================================
+# fastai
+# ==========================================================
+from fastai.data.core import DataLoaders
+from fastai.learner import Learner
+from fastai.callback.tracker import EarlyStoppingCallback, SaveModelCallback
+
+# ==========================================================
+# sklearn
+# ==========================================================
+from sklearn.model_selection import train_test_split
+
+# ==========================================================
+# Project-specific
+# ==========================================================
+import params
+from datasetgenerator import datasetgenerator_bergen, datasetgenerator_mont
+from utils import (
+    build_image_path,
+    build_mask_path,
+    compute_tumor_volume,
+    get_dataloader,
+    monai_unet_model,
+    ThresholdedDice,
+    save_training_artifacts,
+    save_training_plot,
+    evaluate_model_and_compute_dice,
+    debug_plot_first_batch,
+)
+
+
+# ==========================================================
+# Argument parser
+# ==========================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train MONAI 3D UNet for EC tumor segmentation"
+    )
+
+    # --- Modaliteter ---
+    parser.add_argument(
+        "--modalities",
+        nargs="+",
+        required=True,
+        help="Liste over modaliteter, f.eks: T2 ADC vibe2min",
+    )
+    parser.add_argument(
+        "--reference",
+        required=True,
+        help="Referansemodalitet (f.eks T2 eller vibe2min)",
+    )
+
+    # --- Data split ---
+    parser.add_argument("--test_fraction", type=float, default=0.2)
+    parser.add_argument("--validation_fraction", type=float, default=0.1)
+    parser.add_argument("--random_state", type=int, default=42)
+
+    # --- Trening ---
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--img_size", type=int, default=192)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["bergen"],
+        choices=["bergen", "mont"],
+        help="Hvilke datasett som skal brukes i trening (default: bergen)",
+    )
+    
+
+    return parser.parse_args()
+import torchio as tio
+
+def find_crashing_subjects_all_channels(df, modality_names=None):
+    crashes = []
+
+    for idx, row in df.iterrows():
+        img_files = row.imgpath.split(";")
+        mask_path = row.pathmask
+        subj_id = row.subj if "subj" in df.columns else idx
+
+        try:
+            subject_dict = {
+                "ref": tio.ScalarImage(img_files[0]),
+                "mask": tio.LabelMap(mask_path),
+            }
+
+            # legg inn ALLE kanaler
+            for i, p in enumerate(img_files):
+                subject_dict[f"ch{i}"] = tio.ScalarImage(p)
+
+            subject = tio.Subject(subject_dict)
+
+            transform = tio.Compose([
+                tio.Resample(target="ref"),
+            ])
+
+            subject = transform(subject)
+
+            # referanseshape
+            ref_shape = subject["ref"].spatial_shape
+
+            # sjekk ALLE images
+            for name, img in subject.get_images_dict().items():
+                if img.spatial_shape != ref_shape:
+                    crashes.append({
+                        "subj": subj_id,
+                        "image": name,
+                        "ref_shape": ref_shape,
+                        "this_shape": img.spatial_shape,
+                        "path": img.path,
+                    })
+
+        except Exception as e:
+            crashes.append({
+                "subj": subj_id,
+                "image": "EXCEPTION",
+                "error": str(e),
+            })
+
+    return crashes
+
+
+# ==========================================================
+# Main
+# ==========================================================
+def main():
+    args = parse_args()
+
+    pd.set_option("display.max_rows", None)
+    selected_modalities = args.modalities
+    reference = args.reference
+
+    # ------------------------------
+    # GPU
+    # ------------------------------
+    assert torch.cuda.is_available()
+    torch.cuda.set_device(args.gpu)
+    device = torch.device(f"cuda:{args.gpu}")
+    print(f"Bruker GPU {device}")
+
+    # ------------------------------
+    # Datasett
+    # ------------------------------    
+    datasets = args.datasets
+    print(f"Bruker datasett: {datasets}")
+    
+    warnings.filterwarnings(
+        "ignore",
+        message="Using TorchIO images without a torchio.SubjectsLoader",
+    )
+
+    # ==========================================================
+    # 1. Les og filtrer datasett
+    # ==========================================================
+    selected_modalities = args.modalities
+    datasets = args.datasets
+    
+    # --------------------------------------------------
+    # Valider datasett + modaliteter
+    # --------------------------------------------------
+    for ds in datasets:
+        if ds not in params.DATASET_CONFIG:
+            raise ValueError(f"Ukjent datasett: {ds}")    
+        available = params.DATASET_CONFIG[ds]["modalities"].keys()    
+        for m in selected_modalities:
+            if m not in available:
+                raise ValueError(
+                    f"Modalitet '{m}' finnes ikke i datasett '{ds}'. "
+                    f"Tilgjengelig: {list(available)}"
+                )
+
+    # --------------------------------------------------
+    # Valider referanse
+    # --------------------------------------------------
+    if reference not in selected_modalities:
+        raise ValueError(
+            f"Reference '{reference}' må være en av valgte modaliteter: "
+            f"{selected_modalities}"
+        )    
+    print(f"Datasett: {datasets}")
+    print(f"Modaliteter: {selected_modalities}")
+    print(f"Referanse: {reference}")
+
+    #    df = pd.read_csv(params.pathlistvalid, sep=";")
+
+    # Local dataset
+#    require = [params.modalities[m]["col"] for m in selected_modalities]
+#    df = datasetgenerator(df, require)
+    
+    dfs = []
+    # --------------------------------------------------
+    # Bergen-datasett
+    # --------------------------------------------------
+    if "bergen" in datasets:
+        print(f" Leser Bergen-datasett {params.pathlistvalid_bergen}")
+        df_bergen = pd.read_csv(params.pathlistvalid_bergen, sep=";").groupby("subj", as_index=False).first()
+        mod_info = params.DATASET_CONFIG["bergen"]["modalities"]
+        require = [mod_info[m]["col"] for m in selected_modalities]
+        print(f"Krever verdier for {require}")
+        df_bergen = datasetgenerator_bergen(df_bergen, require)
+        df_bergen["source"] = "bergen"    
+        dfs.append(df_bergen)
+
+    # --------------------------------------------------
+    # Mont-datasett
+    # --------------------------------------------------
+    if "mont" in datasets:
+        print(f" Leser Mont-datasett {params.pathlistvalid_mont}")    
+        df_mont = pd.read_csv(params.pathlistvalid_mont, sep=";").groupby("subj", as_index=False).first() # <- egen CSV    
+        mod_info = params.DATASET_CONFIG["mont"]["modalities"]
+        require = [mod_info[m]["col"] for m in selected_modalities]    
+        print(f"Krever verdier for {require}")
+        df_mont = datasetgenerator_mont(df_mont, require)
+        df_mont["source"] = "mont"
+        dfs.append(df_mont)
+
+    # --------------------------------------------------
+    # Slå sammen
+    # --------------------------------------------------
+    if len(dfs) == 0:
+        raise RuntimeError("Ingen datasett valgt - dette skal ikke skje")
+    
+    df = pd.concat(dfs, ignore_index=True)
+            
+    # Bare manuelle datasett
+    df = df.loc[df.dataset == "man"].reset_index(drop=True)
+    print(f"Antall datasett med manuelle masker: {len(df)}")
+
+    print("Antall rader per datasett:")
+    print(df.source.value_counts())
+    
+    # ==========================================================
+    # 2. Bygg paths (PER RAD, basert på source)
+    # ==========================================================
+    
+    df["imgpath"] = [
+        build_image_path(
+            subj=s,
+            modalities=selected_modalities,
+            prepathnii=getattr(params, f"prepathnifti_{src}"),
+            reference=reference,
+            dataset=src,
+        )
+        for s, src in zip(df.subj, df.source)
+    ]
+
+    df["pathmask"] = [
+        build_mask_path(
+            subj=s,
+            maskname=m,
+            prepathnii=getattr(params, f"prepathnifti_{src}"),
+            dataset=src, 
+        )
+        for s, m, src in zip(df.subj, df.pathmask, df.source)
+    ]
+    
+    print("\nDEBUG: Dimensjoner på alle filer i imgpath\n")
+    for idx, row in df.iterrows():
+        print(f"Subj: {row.subj} | Dataset: {row.source}")
+        paths = row.imgpath.split(";")
+    
+        for p in paths:
+            if not os.path.exists(p):
+                print(f"  Mangler fil: {p}")
+                continue
+    
+            img = nib.load(p)
+            shape = img.shape
+    
+            print(f"  {os.path.basename(p)}, {shape}")
+        print("-" * 60)
+
+    # ==========================================================
+    # 3. Tumorvolum + stratified split
+    # ==========================================================
+    print("Beregner tumorvolum ...")
+    df["tumorsize"] = [
+        compute_tumor_volume(p) for p in df["pathmask"].values
+    ]
+
+    df["tumorsize_cat"] = pd.qcut(
+        df["tumorsize"],
+        q=4,
+        labels=["Q1", "Q2", "Q3", "Q4"],
+    )
+    df = df.dropna(subset=["tumorsize_cat"]).reset_index(drop=True)
+
+    bad = find_crashing_subjects_all_channels(df)
+    
+    print(f"\nFant {len(bad)} inkonsistente images:\n")
+    for b in bad:
+        print(
+            f"subj={b['subj']} | "
+            f"img={b['image']} | "
+            f"ref={b['ref_shape']} | "
+            f"this={b['this_shape']} | "
+            f"path={b.get('path','')}"
+        )
+
+    dftrain, dftest = train_test_split(
+        df,
+        test_size=args.test_fraction,
+        stratify=df["tumorsize_cat"],
+        random_state=args.random_state,
+    )
+
+    val_idx = dftrain.sample(
+        frac=args.validation_fraction,
+        random_state=args.random_state,
+    ).index
+
+    dftrain["isval"] = False
+    dftrain.loc[val_idx, "isval"] = True
+
+    print(
+        f"Train: {len(dftrain)}, "
+        f"Val: {dftrain['isval'].sum()}, "
+        f"Test: {len(dftest)}"
+    )
+
+    # ==========================================================
+    # 4. Dataloaders
+    # ==========================================================
+    train_dl = get_dataloader(
+        dftrain[dftrain.isval == False],
+        args.batch_size,
+        args.img_size,
+        selected_modalities,
+        augmentation="robust",
+    )
+
+    val_dl = get_dataloader(
+        dftrain[dftrain.isval == True],
+        args.batch_size,
+        args.img_size,
+        selected_modalities,
+        augmentation="none",
+    )
+
+    # ==========================================================
+    # DEBUG PLOT - slå av/på ved behov
+    # ==========================================================
+    DEBUG_PLOT = False
+    if DEBUG_PLOT:
+        debug_plot_first_batch(
+            dataloader=train_dl,
+            modality_names=selected_modalities,
+            max_items=6,
+        )    
+        return  # stopper før trening
+        
+    dls = DataLoaders(train_dl, val_dl, device=device)
+    dls.n_inp = 1
+
+    # For lagring
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    modalities_str = "_".join(selected_modalities)
+    datasets_str = "+".join(sorted(datasets))
+    basename = (
+        f"UNet_{modalities_str}_{params.version}_"
+        f"{datasets_str}_{timestamp}"
+    )
+    save_dir = os.path.join(params.prepathmodels, basename)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # ==========================================================
+    # 5. Modell
+    # ==========================================================
+    model = monai_unet_model(
+        in_channels=len(selected_modalities),
+        dropout=args.dropout,
+    ).to(device)
+
+    metric = ThresholdedDice()
+
+    learn = Learner(
+        dls,
+        model,
+        loss_func=DiceLoss(sigmoid=True),
+        metrics=[metric],
+        path=save_dir,     # VIKTIG
+        model_dir=".",     # lagre rett i save_dir
+        cbs=[
+            SaveModelCallback(
+                monitor="dice",
+                comp=np.greater,
+                fname="best_model",
+            ),
+            EarlyStoppingCallback(
+                monitor="dice",
+                comp=np.greater,
+                patience=args.patience,
+            ),
+        ],
+    )
+
+    # ==========================================================
+    # 6. Trening
+    # ==========================================================
+    learn.fit_one_cycle(
+        args.epochs,
+        lr_max=args.lr,
+        wd=args.weight_decay,
+    )    
+    learn.load("best_model")
+    
+    # ==========================================================
+    # 6b. Lagre Dice per epoch til CSV
+    # ==========================================================
+    rec = learn.recorder
+    values = np.array(rec.values)  # shape: (n_epochs, 2 + n_metrics)
+    epochs = np.arange(1, len(values) + 1)
+
+    # Kolonnenavn: train_loss, valid_loss, + metrics
+    metric_names = []
+    for m in learn.metrics:
+        metric_names.append(getattr(m, "name", m.__class__.__name__))
+    cols = ["epoch", "train_loss", "valid_loss"] + metric_names
+    df_metrics = pd.DataFrame(
+        np.column_stack([epochs, values]),
+        columns=cols
+    )
+
+    # Lagre til CSV
+    metrics_csv = os.path.join(save_dir, "training_metrics.csv")
+    df_metrics.to_csv(metrics_csv, index=False, sep=';')
+    print(f"Dice og loss lagret til: {metrics_csv}")
+        
+
+    # ==========================================================
+    # Prediker på alle data
+    # ==========================================================
+    
+    print('Applying the model')
+    # Anvend på train
+    train_eval_dl = get_dataloader(
+        dftrain[dftrain.isval == False],
+        args.batch_size,
+        args.img_size,
+        selected_modalities,
+        augmentation="none",
+    )
+    train_dice = evaluate_model_and_compute_dice(
+        model,
+        train_eval_dl,
+        device,
+    )
+    dftrain.loc[dftrain.isval == False, "dice"] = train_dice
+
+    # Anvend på val
+    val_eval_dl = get_dataloader(
+        dftrain[dftrain.isval == True],
+        args.batch_size,
+        args.img_size,
+        selected_modalities,
+        augmentation="none",
+    )
+    
+    val_dice = evaluate_model_and_compute_dice(
+        model,
+        val_eval_dl,
+        device,
+    )    
+    dftrain.loc[dftrain.isval == True, "dice"] = val_dice
+
+    # Anvend på test
+    test_eval_dl = get_dataloader(
+        dftest,
+        args.batch_size,
+        args.img_size,
+        selected_modalities,
+        augmentation="none",
+    )
+    
+    test_dice = evaluate_model_and_compute_dice(
+        model,
+        test_eval_dl,
+        device,
+    )
+    dftest["dice"] = test_dice
+
+    # Check validity
+    assert len(train_dice) == (dftrain.isval == False).sum()
+    assert len(val_dice) == (dftrain.isval == True).sum()
+    assert len(test_dice) == len(dftest)
+
+    # ==========================================================
+    # 7. Lagring
+    # ==========================================================
+
+    #model_path = os.path.join(save_dir, "model_best.pth")
+    #torch.save(model.state_dict(), model_path)
+    model_path = os.path.join(save_dir, "best_model.pth")
+    save_training_artifacts(
+        save_dir=save_dir,
+        basename=basename,
+        timestamp=timestamp,
+        batch_size=args.batch_size,
+        img_size=args.img_size,
+        modalities=selected_modalities,
+        reference=reference,
+        train_df=dftrain[dftrain.isval == False],
+        val_df=dftrain[dftrain.isval == True],
+        test_df=dftest,
+        model_path=model_path,
+        modelname="UNet",
+        dropout=args.dropout,
+        lr=args.lr,
+        epochs=args.epochs,
+        datasets=datasets,
+    )
+    print(f"Ferdig. Resultater lagret i:\n{save_dir}")
+
+    # Save plots of losses
+    print("DEBUG df_metrics columns:", df_metrics.columns.tolist())
+    save_training_plot(df_metrics, save_dir)
+
+
+# ==========================================================
+# Entrypoint
+# ==========================================================
+if __name__ == "__main__":
+    main()

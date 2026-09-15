@@ -1,0 +1,13 @@
+# Secrets
+hf_token
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Large/generated data
+data/
+models/
+prediction/
